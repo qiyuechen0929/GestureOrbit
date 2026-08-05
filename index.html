@@ -1,0 +1,554 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>WebAR: Omni-Directional Deck</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #000; font-family: 'Microsoft YaHei', sans-serif; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 1; }
+        #video-input { display: none; }
+
+        /* UI层 */
+        #ui-layer {
+            position: absolute; width: 100%; height: 100%; pointer-events: none; z-index: 10;
+        }
+
+        /* 顶部状态栏 */
+        .hud-top {
+            position: absolute; top: 20px; left: 0; width: 100%; text-align: center;
+        }
+        .hud-badge {
+            display: inline-block;
+            background: rgba(0, 10, 20, 0.85);
+            border: 1px solid #00e5ff;
+            padding: 8px 24px;
+            border-radius: 20px;
+            color: #fff;
+            font-size: 14px;
+            box-shadow: 0 0 15px rgba(0, 229, 255, 0.3);
+            text-shadow: 0 0 5px #00e5ff;
+        }
+
+        /* 右上角实时反馈视窗 */
+        #gesture-feed-container {
+            position: absolute; top: 20px; right: 20px; z-index: 20;
+            width: 160px; height: 120px;
+            background: rgba(0, 0, 0, 0.8);
+            border: 1px solid #00e5ff;
+            box-shadow: 0 0 15px rgba(0, 229, 255, 0.2);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        #gesture-feed { width: 100%; height: 100%; transform: scaleX(-1); }
+        #gesture-label {
+            position: absolute; bottom: 0; width: 100%;
+            background: rgba(0, 229, 255, 0.2);
+            color: #00e5ff; font-size: 10px; text-align: center; font-weight: bold;
+            padding: 2px 0;
+        }
+
+        /* 底部操作提示 */
+        .hud-bottom {
+            position: absolute; bottom: 40px; width: 100%; text-align: center;
+        }
+        .status-text {
+            color: rgba(255,255,255,0.8); font-size: 14px; letter-spacing: 2px;
+            text-shadow: 0 0 4px #000;
+        }
+        .highlight { color: #ff0055; font-weight: bold; text-shadow: 0 0 10px #ff0055; }
+
+        /* === 全向摇杆视觉辅助 === */
+        #dead-zone {
+            position: absolute; top: 50%; left: 50%; 
+            width: 20vw; height: 20vw; /* 正方形死区 */
+            transform: translate(-50%, -50%);
+            border: 1px dashed rgba(255,255,255,0.1);
+            border-radius: 50%;
+            display: flex; justify-content: center; align-items: center;
+        }
+        #dead-zone::after {
+            content: "+"; color: rgba(0, 229, 255, 0.2); font-size: 40px; font-weight: 100;
+        }
+
+        /* 方向指示器 */
+        .zone-indicator {
+            position: absolute; 
+            font-size: 40px; font-weight: bold; color: rgba(0, 229, 255, 0.15);
+            transition: all 0.2s;
+        }
+        /* 布局 */
+        #arrow-left { top: 50%; left: 10%; transform: translateY(-50%); }
+        #arrow-right { top: 50%; right: 10%; transform: translateY(-50%); }
+        #arrow-up { left: 50%; top: 10%; transform: translateX(-50%); }
+        #arrow-down { left: 50%; bottom: 10%; transform: translateX(-50%); }
+        
+        /* 激活状态 */
+        .zone-active {
+            color: #00e5ff !important;
+            text-shadow: 0 0 20px #00e5ff;
+            transform: scale(1.3);
+        }
+        /* 特殊修正：上下箭头激活时不影响translate */
+        #arrow-up.zone-active { transform: translateX(-50%) scale(1.3); }
+        #arrow-down.zone-active { transform: translateX(-50%) scale(1.3); }
+        #arrow-left.zone-active { transform: translateY(-50%) scale(1.3); }
+        #arrow-right.zone-active { transform: translateY(-50%) scale(1.3); }
+
+        /* 手势光标 */
+        #hand-cursor {
+            position: absolute; top: 50%; left: 50%;
+            width: 40px; height: 40px;
+            border: 2px solid #fff;
+            border-radius: 50%;
+            transform: translate(-50%, -50%);
+            box-shadow: 0 0 10px #fff;
+            transition: background-color 0.2s, border-color 0.2s;
+            display: none;
+            z-index: 21;
+        }
+        #hand-cursor.active { border-color: #00e5ff; box-shadow: 0 0 20px #00e5ff; }
+        #hand-cursor.fist { border-color: #ff0055; background: rgba(255,0,85,0.3); box-shadow: 0 0 30px #ff0055; }
+
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #00e5ff; font-size: 18px; z-index: 50; font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+    <div id="loading">全向引擎启动中...</div>
+    
+    <div id="gesture-feed-container">
+        <canvas id="gesture-feed" width="320" height="240"></canvas>
+        <div id="gesture-label">视觉同步中</div>
+    </div>
+
+    <div id="ui-layer">
+        <div class="hud-top"><div class="hud-badge" id="top-msg">等待连接</div></div>
+        
+        <div id="dead-zone"></div>
+        <div id="arrow-left" class="zone-indicator">◀</div>
+        <div id="arrow-right" class="zone-indicator">▶</div>
+        <div id="arrow-up" class="zone-indicator">▲</div>
+        <div id="arrow-down" class="zone-indicator">▼</div>
+
+        <div class="hud-bottom">
+            <div class="status-text" id="bot-msg">请将手掌移入摄像头</div>
+        </div>
+    </div>
+
+    <div id="hand-cursor"></div>
+
+    <video id="video-input"></video>
+    <div id="canvas-container"></div>
+
+    <script src="https://unpkg.com/three@0.128.0/build/three.min.js"></script>
+    <script src="https://unpkg.com/@mediapipe/camera_utils/camera_utils.js"></script>
+    <script src="https://unpkg.com/@mediapipe/drawing_utils/drawing_utils.js"></script>
+    <script src="https://unpkg.com/@mediapipe/hands/hands.js"></script>
+
+    <script>
+        // ==========================================
+        // 1. 纹理生成
+        // ==========================================
+        function generateBackTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; canvas.height = 768;
+            const ctx = canvas.getContext('2d');
+            ctx.fillStyle = "#050508"; ctx.fillRect(0,0,512,768);
+            ctx.fillStyle = "rgba(0, 229, 255, 0.05)";
+            for(let i=0; i<768; i+=6) if(i%20 === 0) ctx.fillRect(0, i, 512, 2);
+            ctx.strokeStyle = "rgba(0, 229, 255, 0.8)"; ctx.lineWidth = 4;
+            ctx.strokeRect(60, 60, 392, 648);
+            ctx.beginPath(); ctx.arc(256, 384, 90, 0, Math.PI*2); 
+            ctx.strokeStyle = "#00e5ff"; ctx.lineWidth = 10; ctx.stroke();
+            ctx.fillStyle = "#00e5ff"; ctx.font = "bold 32px Arial"; 
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText("LOCKED", 256, 384);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        function generateFrontTexture(index) {
+            const canvas = document.createElement('canvas');
+            canvas.width = 512; canvas.height = 768;
+            const ctx = canvas.getContext('2d');
+            const hue = (index * 50) % 360;
+            const grad = ctx.createLinearGradient(0,0,0,768);
+            grad.addColorStop(0, `hsl(${hue}, 80%, 20%)`);
+            grad.addColorStop(1, `hsl(${hue}, 90%, 5%)`);
+            ctx.fillStyle = grad; ctx.fillRect(0,0,512,768);
+            ctx.strokeStyle = `hsl(${hue}, 100%, 70%)`; ctx.lineWidth = 15;
+            ctx.strokeRect(10,10,492,748);
+            ctx.fillStyle = "rgba(255,255,255,0.1)"; ctx.fillRect(50, 100, 412, 400);
+            ctx.fillStyle = "#fff"; ctx.font = "bold 200px Impact"; 
+            ctx.textAlign = "center"; ctx.textBaseline = "middle";
+            ctx.fillText(index+1, 256, 300);
+            ctx.font = "bold 40px 'Microsoft YaHei'";
+            ctx.fillText("已激活", 256, 600);
+            ctx.font = "24px 'Microsoft YaHei'";
+            ctx.fillStyle = "rgba(255,255,255,0.6)";
+            ctx.fillText(`ID: ALPHA-${index+100}`, 256, 650);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        // ==========================================
+        // 2. 配置参数
+        // ==========================================
+        const CONFIG = {
+            cardCount: 14,
+            ringRadius: 7.0,
+            
+            // --- 全向摇杆参数 ---
+            deadZone: 0.12,       // 死区半径
+            maxSpeedX: 0.05,      // 左右最大转速
+            maxSpeedY: 0.02,      // 上下最大转速 (不需要太快)
+            
+            // X轴(倾斜) 限制
+            minRotX: -0.4,        // 向上看限制 (弧度)
+            maxRotX: 0.4,         // 向下看限制 (弧度)
+            
+            snapSpeed: 0.1,
+            inspectScale: 1.1,
+            inspectPull: 2.0
+        };
+
+        const STATE = {
+            handDetected: false,
+            handX: 0.5, handY: 0.5,
+            isFist: false,
+            
+            rotationY: 0,         // 左右旋转 (主轴)
+            velocityY: 0,
+            
+            rotationX: 0,         // 上下倾斜 (副轴)
+            velocityX: 0,
+            
+            focusedIndex: 0,
+            inspectFactor: 0
+        };
+
+        let scene, camera, renderer, ringGroup, particleSystem, rings;
+        let cards = [];
+        let backTexture;
+
+        // ==========================================
+        // 3. 场景构建
+        // ==========================================
+        function initThree() {
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            scene.fog = new THREE.FogExp2(0x000000, 0.035);
+
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 100);
+            camera.position.set(0, 0, 14);
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+            container.appendChild(renderer.domElement);
+
+            scene.add(new THREE.AmbientLight(0xffffff, 0.2));
+            const pl = new THREE.PointLight(0x00e5ff, 1.5, 30);
+            pl.position.set(0, 5, 5);
+            scene.add(pl);
+
+            // 装饰环
+            rings = new THREE.Group();
+            const ringGeo = new THREE.TorusGeometry(10, 0.03, 16, 100);
+            const ringMat = new THREE.MeshBasicMaterial({ color: 0x00e5ff, transparent: true, opacity: 0.2 });
+            const r1 = new THREE.Mesh(ringGeo, ringMat); r1.rotation.x = Math.PI/2;
+            const r2 = new THREE.Mesh(ringGeo, ringMat); r2.rotation.x = Math.PI/1.8; r2.scale.setScalar(0.9);
+            rings.add(r1); rings.add(r2);
+            scene.add(rings);
+
+            // 卡牌组
+            ringGroup = new THREE.Group();
+            scene.add(ringGroup);
+            backTexture = generateBackTexture();
+
+            const cardGeo = new THREE.BoxGeometry(2.1, 3.1, 0.05);
+
+            for(let i=0; i<CONFIG.cardCount; i++) {
+                const angle = (Math.PI*2 / CONFIG.cardCount) * i;
+                const frontTex = generateFrontTexture(i);
+
+                const mats = [
+                    new THREE.MeshBasicMaterial({color: 0x111}),
+                    new THREE.MeshBasicMaterial({color: 0x111}),
+                    new THREE.MeshBasicMaterial({color: 0x111}),
+                    new THREE.MeshBasicMaterial({color: 0x111}),
+                    new THREE.MeshBasicMaterial({map: backTexture}), 
+                    new THREE.MeshBasicMaterial({map: backTexture})
+                ];
+
+                const card = new THREE.Mesh(cardGeo, mats);
+                card.position.x = CONFIG.ringRadius * Math.sin(angle);
+                card.position.z = CONFIG.ringRadius * Math.cos(angle);
+                card.rotation.y = angle;
+                card.userData = { baseAngle: angle, index: i, frontTexture: frontTex };
+                ringGroup.add(card);
+                cards.push(card);
+            }
+
+            const pGeo = new THREE.BufferGeometry();
+            const pPos = [];
+            for(let i=0; i<1500; i++) pPos.push((Math.random()-0.5)*50, (Math.random()-0.5)*30, (Math.random()-0.5)*50);
+            pGeo.setAttribute('position', new THREE.Float32BufferAttribute(pPos, 3));
+            const pMat = new THREE.PointsMaterial({color: 0x00e5ff, size: 0.1, transparent: true, opacity: 0.4});
+            particleSystem = new THREE.Points(pGeo, pMat);
+            scene.add(particleSystem);
+        }
+
+        // ==========================================
+        // 4. 逻辑核心 (XY 摇杆)
+        // ==========================================
+        function updateLogic() {
+            
+            let targetVelY = 0; // 控制 Y 轴旋转 (左右)
+            let targetVelX = 0; // 控制 X 轴旋转 (上下倾斜)
+
+            if (STATE.handDetected && !STATE.isFist) {
+                // 计算 XY 偏移 (-0.5 到 0.5)
+                const offX = STATE.handX - 0.5;
+                const offY = STATE.handY - 0.5;
+                
+                // 死区判断 (圆形死区)
+                const dist = Math.sqrt(offX*offX + offY*offY);
+                
+                if (dist > CONFIG.deadZone) {
+                    // 归一化力度
+                    const force = (dist - CONFIG.deadZone) / (0.5 - CONFIG.deadZone);
+                    
+                    // --- 左右控制 (主轴) ---
+                    // 手在右(>0) -> 向右转(-angle)
+                    targetVelY = -Math.sign(offX) * force * CONFIG.maxSpeedX * (Math.abs(offX)/dist);
+
+                    // --- 上下控制 (副轴) ---
+                    // 手在下(>0) -> 向下看(X减小? No, X增加是低头)
+                    // 手往下移(offY > 0) -> 希望看到下面 -> 圆环向上翘 -> rotationX 增加
+                    targetVelX = Math.sign(offY) * force * CONFIG.maxSpeedY * (Math.abs(offY)/dist);
+                }
+            }
+
+            // 如果握拳，强制回正 X 轴 (让卡牌正对屏幕)
+            if (STATE.isFist) {
+                targetVelX = 0;
+                // 缓动归零 X 轴
+                STATE.rotationX += (0 - STATE.rotationX) * 0.1;
+                STATE.velocityX = 0;
+            } else {
+                // 平滑应用 X 轴速度
+                STATE.velocityX += (targetVelX - STATE.velocityX) * 0.1;
+                STATE.rotationX += STATE.velocityX;
+                
+                // 限制倾斜角度
+                STATE.rotationX = Math.max(CONFIG.minRotX, Math.min(CONFIG.maxRotX, STATE.rotationX));
+            }
+
+            // 平滑应用 Y 轴速度
+            STATE.velocityY += (targetVelY - STATE.velocityY) * 0.1;
+            
+            // 磁吸逻辑 (仅针对 Y 轴)
+            if (!STATE.isFist && Math.abs(targetVelY) === 0 && Math.abs(STATE.velocityY) < 0.002) {
+                STATE.velocityY = 0; 
+                const step = (Math.PI * 2) / CONFIG.cardCount;
+                const targetRot = Math.round(STATE.rotationY / step) * step;
+                STATE.rotationY += (targetRot - STATE.rotationY) * CONFIG.snapSpeed;
+            } else {
+                STATE.rotationY += STATE.velocityY;
+            }
+
+            // 应用变换
+            // 注意：顺序很重要。这里我们旋转 Group。
+            ringGroup.rotation.y = STATE.rotationY;
+            ringGroup.rotation.x = STATE.rotationX; // 新增倾斜
+            
+            // 装饰跟随
+            rings.rotation.y += 0.003;
+            rings.rotation.x = STATE.rotationX * 0.5; // 环也跟着稍微倾斜
+
+            if(particleSystem) {
+                particleSystem.rotation.y = STATE.rotationY * 0.3;
+                particleSystem.rotation.x = STATE.rotationX * 0.3;
+            }
+
+            // --- 卡牌聚焦逻辑 ---
+            let normRot = -STATE.rotationY % (Math.PI * 2);
+            if (normRot < 0) normRot += Math.PI * 2;
+
+            let minDiff = 100;
+            cards.forEach(c => {
+                let diff = Math.abs(c.userData.baseAngle - normRot);
+                if (diff > Math.PI) diff = Math.PI * 2 - diff;
+                if (diff < minDiff) {
+                    minDiff = diff;
+                    STATE.focusedIndex = c.userData.index;
+                }
+            });
+
+            const targetInspect = STATE.isFist ? 1.0 : 0.0;
+            STATE.inspectFactor += (targetInspect - STATE.inspectFactor) * 0.15;
+
+            cards.forEach((card, i) => {
+                const isTarget = (i === STATE.focusedIndex);
+                let tx = CONFIG.ringRadius * Math.sin(card.userData.baseAngle);
+                let tz = CONFIG.ringRadius * Math.cos(card.userData.baseAngle);
+                let scale = 1.0;
+                let ry = card.userData.baseAngle;
+
+                if (isTarget && STATE.inspectFactor > 0.01) {
+                     card.material[5].map = card.userData.frontTexture; 
+                } else {
+                     card.material[5].map = backTexture;
+                }
+
+                if (isTarget && STATE.inspectFactor > 0.01) {
+                    const pull = CONFIG.ringRadius + CONFIG.inspectPull;
+                    tx = pull * Math.sin(card.userData.baseAngle);
+                    tz = pull * Math.cos(card.userData.baseAngle);
+                    scale = THREE.MathUtils.lerp(1.0, CONFIG.inspectScale, STATE.inspectFactor);
+                    ry = card.userData.baseAngle + Math.PI * STATE.inspectFactor;
+                }
+
+                card.position.x += (tx - card.position.x) * 0.1;
+                card.position.z += (tz - card.position.z) * 0.1;
+                card.rotation.y += (ry - card.rotation.y) * 0.1;
+                card.scale.setScalar(scale);
+            });
+
+            updateUI();
+        }
+
+        // ==========================================
+        // 5. UI 更新 (全向显示)
+        // ==========================================
+        const cursor = document.getElementById('hand-cursor');
+        const arrowLeft = document.getElementById('arrow-left');
+        const arrowRight = document.getElementById('arrow-right');
+        const arrowUp = document.getElementById('arrow-up');
+        const arrowDown = document.getElementById('arrow-down');
+        const topMsg = document.getElementById('top-msg');
+        const botMsg = document.getElementById('bot-msg');
+
+        function updateUI() {
+            if (STATE.handDetected) {
+                cursor.style.display = 'block';
+                const sx = (1 - STATE.handX) * 100;
+                const sy = STATE.handY * 100;
+                cursor.style.left = sx + '%';
+                cursor.style.top = sy + '%';
+
+                if (STATE.isFist) {
+                    cursor.className = 'grabbing';
+                    topMsg.innerHTML = `正在读取: <span style="color:#00e5ff">核心数据 #${STATE.focusedIndex + 1}</span>`;
+                    botMsg.innerHTML = "松开手掌返回隐形模式";
+                    // 握拳时隐藏方向指示
+                    [arrowLeft, arrowRight, arrowUp, arrowDown].forEach(el => el.classList.remove('zone-active'));
+                } else {
+                    cursor.className = 'active';
+                    
+                    const offX = STATE.handX - 0.5;
+                    const offY = STATE.handY - 0.5;
+                    const dist = Math.sqrt(offX*offX + offY*offY);
+
+                    if (dist > CONFIG.deadZone) {
+                        topMsg.innerText = "调整视角中...";
+                        
+                        // X轴判断
+                        if (offX < -CONFIG.deadZone/1.5) {
+                            arrowLeft.classList.add('zone-active'); arrowRight.classList.remove('zone-active');
+                        } else if (offX > CONFIG.deadZone/1.5) {
+                            arrowLeft.classList.remove('zone-active'); arrowRight.classList.add('zone-active');
+                        } else {
+                            arrowLeft.classList.remove('zone-active'); arrowRight.classList.remove('zone-active');
+                        }
+
+                        // Y轴判断
+                        if (offY < -CONFIG.deadZone/1.5) {
+                            arrowUp.classList.add('zone-active'); arrowDown.classList.remove('zone-active');
+                        } else if (offY > CONFIG.deadZone/1.5) {
+                            arrowUp.classList.remove('zone-active'); arrowDown.classList.add('zone-active');
+                        } else {
+                            arrowUp.classList.remove('zone-active'); arrowDown.classList.remove('zone-active');
+                        }
+
+                    } else {
+                        topMsg.innerText = "● 待机中";
+                        [arrowLeft, arrowRight, arrowUp, arrowDown].forEach(el => el.classList.remove('zone-active'));
+                    }
+                    botMsg.innerHTML = "全向摇杆：上下倾斜 / 左右旋转";
+                }
+            } else {
+                cursor.style.display = 'none';
+                topMsg.innerText = "信号丢失";
+                botMsg.innerText = "请举起手掌激活系统";
+                [arrowLeft, arrowRight, arrowUp, arrowDown].forEach(el => el.classList.remove('zone-active'));
+            }
+        }
+
+        // ==========================================
+        // 6. MediaPipe
+        // ==========================================
+        const feedCanvas = document.getElementById('gesture-feed');
+        const feedCtx = feedCanvas.getContext('2d');
+
+        function onResults(results) {
+            document.getElementById('loading').style.display = 'none';
+            feedCtx.clearRect(0,0,320,240);
+            feedCtx.drawImage(results.image, 0, 0, 320, 240);
+
+            if (results.multiHandLandmarks && results.multiHandLandmarks.length > 0) {
+                STATE.handDetected = true;
+                const lm = results.multiHandLandmarks[0];
+                drawConnectors(feedCtx, lm, HAND_CONNECTIONS, {color: '#00e5ff', lineWidth: 2});
+                drawLandmarks(feedCtx, lm, {color: STATE.isFist ? '#ff0055' : '#fff', lineWidth: 1, radius: 2});
+
+                const cx = (lm[0].x + lm[9].x) / 2;
+                const cy = (lm[0].y + lm[9].y) / 2;
+                STATE.handX = STATE.handX * 0.8 + cx * 0.2;
+                STATE.handY = STATE.handY * 0.8 + cy * 0.2;
+
+                const wrist = lm[0];
+                let bent = 0;
+                [12, 16, 20].forEach(i => {
+                    const dTip = Math.hypot(lm[i].x-wrist.x, lm[i].y-wrist.y);
+                    const dPip = Math.hypot(lm[i-2].x-wrist.x, lm[i-2].y-wrist.y);
+                    if(dTip < dPip) bent++;
+                });
+                STATE.isFist = bent >= 2;
+            } else {
+                STATE.handDetected = false;
+                STATE.isFist = false;
+            }
+        }
+
+        initThree();
+        const hands = new Hands({locateFile: (file) => `https://unpkg.com/@mediapipe/hands/${file}`});
+        hands.setOptions({ maxNumHands: 1, modelComplexity: 1, minDetectionConfidence: 0.5, minTrackingConfidence: 0.5 });
+        hands.onResults(onResults);
+
+        const video = document.getElementById('video-input');
+        const cameraUtils = new Camera(video, {
+            onFrame: async () => await hands.send({image: video}),
+            width: 640, height: 480
+        });
+        cameraUtils.start();
+
+        function animate() {
+            requestAnimationFrame(animate);
+            updateLogic();
+            renderer.render(scene, camera);
+        }
+        animate();
+        
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+    </script>
+</body>
+</html>
